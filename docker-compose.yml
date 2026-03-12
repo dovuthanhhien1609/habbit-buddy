@@ -1,0 +1,76 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: habit
+      POSTGRES_PASSWORD: habit
+      POSTGRES_DB: habitbuddy
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U habit -d habitbuddy"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── go-redis (custom Redis-compatible server) ───────────────────────────────
+  go-redis:
+    build:
+      context: ./services/go-redis
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 6379 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Go Backend API + WebSocket server ───────────────────────────────────────
+  backend:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: "postgres://habit:habit@postgres:5432/habitbuddy?sslmode=disable"
+      REDIS_ADDR: "go-redis:6379"
+      JWT_SECRET: "change-me-in-production-use-a-long-random-string"
+      PORT: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      go-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── React Frontend (nginx) ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
