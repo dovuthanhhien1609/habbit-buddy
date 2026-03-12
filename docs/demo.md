@@ -3,6 +3,8 @@
 ## Setup
 
 ```bash
+git clone --recurse-submodules <repo-url>
+cd habit-buddy
 docker compose up --build
 # Navigate to http://localhost:3000
 ```
@@ -40,11 +42,14 @@ redis-cli -p 6379 GET hb:habit:<habitId>:streak
 # Returns: "1"
 
 # Check the daily counter
-redis-cli -p 6379 GET hb:user:<userId>:daily:2026-03-11
+redis-cli -p 6379 GET hb:user:<userId>:daily:$(date +%Y-%m-%d)
 # Returns: "1"
 
 # List all keys
 redis-cli -p 6379 KEYS "hb:*"
+
+# Watch pub/sub events live (open before clicking "Mark done")
+redis-cli -p 6379 SUBSCRIBE hb:events
 ```
 
 Or watch the go-redis logs:
@@ -65,13 +70,13 @@ docker compose logs go-redis -f
 ## Talking Points
 
 **Architecture:**
-> "The backend is Go with a Chi router. When a habit is completed, it writes to PostgreSQL for durability, then updates the streak counter in our custom go-redis server."
+> "The backend is Go with a Chi router. When a habit is completed, it writes to PostgreSQL for durability, updates the streak counter in our custom go-redis server, then publishes an event to a Redis pub/sub channel."
 
 **go-redis:**
-> "go-redis is a Redis-compatible server built from scratch in Go. It speaks the RESP protocol over TCP, has a thread-safe in-memory store, and persists commands to an append-only file."
+> "go-redis is a Redis-compatible server built from scratch in Go. It speaks the RESP v2 protocol over TCP, supports strings, hashes, counters, key expiry, pub/sub, and an append-only file for persistence. It lives in the repo as a git submodule."
 
 **Realtime:**
-> "The second tab just updated without any manual refresh. The backend emits an event to our WebSocket hub, which fans it out to all open connections for that user."
+> "The second tab just updated without any manual refresh. The backend publishes a JSON event to go-redis on the `hb:events` channel. An EventBridge goroutine subscribed to that channel picks it up and fans it out to all open WebSocket connections for that user. Because the event goes through Redis, you could run multiple API instances and every instance would receive and deliver it."
 
 **Key design:**
-> "The streak counter lives in go-redis as a simple string key: `hb:habit:{id}:streak`. It's O(1) to read, which is why dashboard loads are fast even with many habits."
+> "The streak counter lives in go-redis as a plain string key: `hb:habit:{id}:streak`. It's O(1) to read, which is why dashboard loads are fast even with many habits."

@@ -1,42 +1,64 @@
-# Redis Integration Notes
+# Redis Integration
 
-## go-redis Overview
+## Overview
 
-`services/go-redis` is a custom Redis-compatible server written in Go.
+`services/go-redis` is a custom Redis-compatible server written in Go (git submodule).
+It is the only Redis dependency — no external Redis installation is required.
 
 Module: `github.com/hiendvt/go-redis`
 
-### Supported commands
-- `PING [message]` — connectivity check
-- `SET key value` — store key-value pair (persisted to AOF)
-- `GET key` — retrieve value (nil if not found)
-- `DEL key [key ...]` — delete keys (persisted to AOF)
-- `EXISTS key [key ...]` — check key existence
-- `KEYS pattern` — list keys matching glob pattern
-- `COMMAND` — introspection
+The backend uses go-redis for three things:
+1. **Caching** — habit lists are cached as JSON to avoid repeated DB queries
+2. **Counters** — streak values and daily completion counts stored as integers
+3. **Realtime events** — pub/sub on `hb:events` fans out WebSocket notifications across API instances
 
-### Not yet supported
-- `INCR / INCRBY` — emulated in the backend RESP client via GET+SET
-- `EXPIRE / TTL` — not available; cache invalidation is manual DEL
-- `SUBSCRIBE / PUBLISH` — planned; replaced by in-process Go channel bus
+---
+
+## Supported Commands
+
+| Category   | Commands |
+|------------|----------|
+| Strings    | `SET`, `GET`, `DEL`, `EXISTS`, `KEYS`, `MSET`, `MGET`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETDEL`, `APPEND`, `STRLEN` |
+| Counters   | `INCR`, `INCRBY`, `DECR`, `DECRBY` |
+| Expiry     | `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST` |
+| Hashes     | `HSET`, `HMSET`, `HGET`, `HDEL`, `HGETALL`, `HMGET`, `HLEN`, `HEXISTS`, `HKEYS`, `HVALS`, `HINCRBY` |
+| Pub/Sub    | `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE` |
+| Connection | `PING`, `SELECT` |
+| Admin      | `INFO`, `DBSIZE`, `TYPE`, `RENAME`, `FLUSHDB`, `FLUSHALL`, `COMMAND` |
+
+---
 
 ## Backend RESP Client
 
-`apps/api/internal/redisclient/client.go` speaks RESP directly over TCP.
-
-No Redis library is used. The client:
-1. Opens a TCP connection to `REDIS_ADDR` (default `localhost:6379`)
-2. Serialises commands as RESP arrays (`*N\r\n$len\r\narg\r\n...`)
-3. Parses responses (simple string, error, integer, bulk string, array)
-4. Uses a `sync.Mutex` to serialise commands on a single connection
+`apps/api/internal/redisclient/client.go` speaks RESP directly over TCP — no Redis library is used.
 
 ```go
 client, _ := redisclient.NewClient("localhost:6379")
+
+// String operations
 client.Set("hb:habit:abc:streak", "7")
 val, found, _ := client.Get("hb:habit:abc:streak")
 client.Del("hb:user:xyz:habits")
-n, _ := client.Incr("hb:user:xyz:total") // emulated with GET+SET
+
+// Native counter — uses INCR command
+n, _ := client.Incr("hb:user:xyz:total")   // → 1, 2, 3, …
+
+// Publish a realtime event
+n, _ := client.Publish("hb:events", `{"userID":"xyz","type":"HABIT_COMPLETED",...}`)
 ```
+
+For pub/sub subscriptions a **dedicated connection** is required (a subscribed connection cannot issue regular commands):
+
+```go
+sub, _ := redisclient.NewSubscriber("localhost:6379")
+sub.Subscribe("hb:events")
+
+for msg := range sub.Messages() {
+    fmt.Println(msg.Channel, msg.Payload)
+}
+```
+
+---
 
 ## Key Naming Convention
 
@@ -48,20 +70,57 @@ hb:habit:{habitId}:streak        → integer string, current streak
 hb:habit:{habitId}:last_date     → "YYYY-MM-DD" of last completion
 hb:user:{userId}:daily:{date}    → integer count for that date
 hb:user:{userId}:total           → lifetime completions integer
+hb:events                        → pub/sub channel for WebSocket events
 ```
+
+---
 
 ## Cache Invalidation Strategy
 
-Since go-redis doesn't support TTL yet, invalidation is manual:
-- On `CreateHabit`, `UpdateHabit`, `ArchiveHabit` → DEL `hb:user:{id}:habits`
-- On `CompleteHabit`, `UndoCompletion` → DEL `hb:user:{id}:habits`
+go-redis supports `EXPIRE` / `TTL`, but the habit-buddy cache uses manual invalidation for simplicity — a DEL on write, rebuild on the next read.
 
-The cache is rebuilt on the next `GetDashboard` or `GetHabits` call.
+Invalidation points:
+- `CreateHabit`, `UpdateHabit`, `ArchiveHabit` → `DEL hb:user:{id}:habits`
+- `CompleteHabit`, `UndoCompletion` → `DEL hb:user:{id}:habits`
 
-## Pub/Sub Migration Path
+---
 
-When go-redis adds SUBSCRIBE/PUBLISH:
-1. Replace the in-process Go channel bus in `internal/ws/hub.go` with a Redis subscriber
-2. The WS hub opens a separate TCP connection and issues `SUBSCRIBE habit:completed:{userId}`
-3. The API handler issues `PUBLISH habit:completed:{userId} <json-payload>` after each completion
-4. No frontend or API interface changes needed
+## Realtime Pub/Sub Architecture
+
+Completing a habit triggers a Redis-routed event instead of a direct in-process broadcast. This decouples the HTTP handler from the WebSocket hub and allows multiple API instances to each fan-out to their own clients.
+
+```
+HTTP handler
+    └─ bridge.Publish(userID, WSEvent)
+            │
+            ▼
+    client.Publish("hb:events", JSON envelope)
+            │
+            ▼  (RESP pub/sub wire protocol)
+    go-redis broker fans out to all subscribers
+            │
+            ▼
+    EventBridge.run()  (subscribes on startup via redisclient.Subscriber)
+            │
+            └─ hub.BroadcastToUser(userID, event) → all open WS tabs
+```
+
+**Key files:**
+
+| File | Role |
+|------|------|
+| `internal/redisclient/client.go` | `Publish(channel, message)` method |
+| `internal/redisclient/subscriber.go` | `Subscriber` — dedicated pub/sub connection, decodes RESP push frames |
+| `internal/ws/bridge.go` | `EventBridge` — subscribes to `hb:events`, routes to WS hub |
+| `internal/ws/hub.go` | Local per-process WebSocket fan-out |
+| `internal/api/handlers.go` | Calls `bridge.Publish` on `CompleteHabit` / `UndoCompletion` |
+
+**Event envelope format (JSON, sent as pub/sub payload):**
+
+```json
+{
+  "userID":  "550e8400-e29b-41d4-a716-446655440000",
+  "type":    "HABIT_COMPLETED",
+  "payload": { "habitId": "...", "habitName": "Morning Run", "streak": 7, "completedAt": "..." }
+}
+```

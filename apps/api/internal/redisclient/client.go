@@ -10,7 +10,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -19,7 +18,6 @@ type Client struct {
 	addr   string
 	conn   net.Conn
 	reader *bufio.Reader
-	mu     sync.Mutex
 }
 
 // NewClient dials the go-redis server at addr (e.g. "localhost:6379").
@@ -87,64 +85,21 @@ func (c *Client) Publish(channel, message string) (int64, error) {
 // Incr increments the integer stored at key and returns the new value.
 // If the key does not exist it is initialised to 0 before incrementing.
 func (c *Client) Incr(key string) (int64, error) {
-	// go-redis doesn't support INCR yet, so we emulate it with GET+SET.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	val, found, err := c.getUnlocked(key)
+	resp, err := c.do("INCR", key)
 	if err != nil {
 		return 0, err
 	}
-	var n int64
-	if found {
-		n, err = strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("redisclient: Incr: value is not an integer: %s", val)
-		}
-	}
-	n++
-	if err := c.setUnlocked(key, strconv.FormatInt(n, 10)); err != nil {
-		return 0, err
+	n, err := strconv.ParseInt(resp, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("redisclient: Incr: unexpected response: %s", resp)
 	}
 	return n, nil
-}
-
-// ---- internal helpers (must be called with mu held for Incr) ----
-
-func (c *Client) getUnlocked(key string) (string, bool, error) {
-	if err := c.send("GET", key); err != nil {
-		return "", false, err
-	}
-	val, err := c.readResponse()
-	if err != nil {
-		return "", false, err
-	}
-	if val == nil {
-		return "", false, nil
-	}
-	return *val, true, nil
-}
-
-func (c *Client) setUnlocked(key, value string) error {
-	if err := c.send("SET", key, value); err != nil {
-		return err
-	}
-	val, err := c.readResponse()
-	if err != nil {
-		return err
-	}
-	if val == nil || *val != "OK" {
-		return fmt.Errorf("redisclient: SET unexpected: %v", val)
-	}
-	return nil
 }
 
 // ---- low-level send/receive ----
 
 // do executes a command and returns the response as a string.
 func (c *Client) do(args ...string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.send(args...); err != nil {
 		return "", err
 	}
@@ -160,8 +115,6 @@ func (c *Client) do(args ...string) (string, error) {
 
 // doRaw executes a command and returns a nullable string pointer.
 func (c *Client) doRaw(args ...string) (*string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.send(args...); err != nil {
 		return nil, err
 	}
