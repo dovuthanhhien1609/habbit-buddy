@@ -4,14 +4,19 @@ A realtime habit tracking application that demonstrates modern fullstack archite
 
 ## Architecture
 
-```
-Browser (React) ──HTTP/WS──► Go Backend ──SQL──► PostgreSQL
-                                    │
-                                    ├──RESP──► go-redis (caching, counters)
-                                    │
-                                    └──RESP pub/sub──► go-redis (realtime events)
-                                            │
-                                    ◄───────┘ (hb:events channel → WS hub → Browser)
+```mermaid
+flowchart LR
+    Browser["Browser\n(React)"]
+    Backend["Go Backend"]
+    PG["PostgreSQL"]
+    Redis["go-redis"]
+
+    Browser -->|"HTTP / WS"| Backend
+    Backend -->|"SQL"| PG
+    Backend -->|"RESP (cache + counters)"| Redis
+    Backend -->|"RESP pub/sub PUBLISH"| Redis
+    Redis -->|"hb:events → WS hub"| Backend
+    Backend -->|"WebSocket push"| Browser
 ```
 
 **Key points:**
@@ -80,24 +85,22 @@ WS     /ws?token=<jwt>
 
 ## Realtime Event Flow
 
-```
-HTTP handler (CompleteHabit)
-    │
-    ├─ writes to PostgreSQL
-    ├─ updates Redis streak key
-    └─ bridge.Publish("hb:events", {userID, type, payload})
-                │
-                ▼
-        go-redis PUBLISH
-                │
-                ▼
-        EventBridge.run()  ← subscribed to "hb:events" on startup
-                │
-                ▼
-        hub.BroadcastToUser(userID, event)
-                │
-                ▼
-        WebSocket clients (all open tabs for that user)
+```mermaid
+flowchart TB
+    Handler["HTTP handler\nCompleteHabit"]
+    PG["PostgreSQL\nwrite habit_completion"]
+    RedisKey["go-redis\nupdate streak key"]
+    Publish["go-redis\nPUBLISH hb:events"]
+    Bridge["EventBridge.run()\nsubscribed on startup"]
+    Hub["hub.BroadcastToUser\n(userID, event)"]
+    WS["WebSocket clients\nall open tabs for that user"]
+
+    Handler --> PG
+    Handler --> RedisKey
+    Handler --> Publish
+    Publish -->|"hb:events message"| Bridge
+    Bridge --> Hub
+    Hub --> WS
 ```
 
 ## Development (without Docker)

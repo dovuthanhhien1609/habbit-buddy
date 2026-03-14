@@ -89,20 +89,20 @@ Invalidation points:
 
 Completing a habit triggers a Redis-routed event instead of a direct in-process broadcast. This decouples the HTTP handler from the WebSocket hub and allows multiple API instances to each fan-out to their own clients.
 
-```
-HTTP handler
-    └─ bridge.Publish(userID, WSEvent)
-            │
-            ▼
-    client.Publish("hb:events", JSON envelope)
-            │
-            ▼  (RESP pub/sub wire protocol)
-    go-redis broker fans out to all subscribers
-            │
-            ▼
-    EventBridge.run()  (subscribes on startup via redisclient.Subscriber)
-            │
-            └─ hub.BroadcastToUser(userID, event) → all open WS tabs
+```mermaid
+flowchart TB
+    Handler["HTTP handler"]
+    Publish["client.Publish\nhb:events · JSON envelope"]
+    Broker["go-redis broker\nfan-out to all subscribers\n(RESP pub/sub wire protocol)"]
+    Bridge["EventBridge.run()\nsubscribes on startup\nvia redisclient.Subscriber"]
+    Hub["hub.BroadcastToUser\n(userID, event)"]
+    WS["All open WS tabs"]
+
+    Handler -->|"bridge.Publish(userID, WSEvent)"| Publish
+    Publish --> Broker
+    Broker --> Bridge
+    Bridge --> Hub
+    Hub --> WS
 ```
 
 **Key files:**
