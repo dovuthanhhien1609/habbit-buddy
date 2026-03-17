@@ -211,9 +211,13 @@ func (h *HabitHandler) GetAnalytics(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		history := stats.History
+		if history == nil {
+			history = []string{}
+		}
 		results = append(results, habitAnalytic{
 			Habit:   hb,
-			History: stats.History,
+			History: history,
 		})
 	}
 

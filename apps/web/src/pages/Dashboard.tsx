@@ -16,7 +16,7 @@ export function Dashboard() {
 
   useEffect(() => {
     habitApi.getDashboard()
-      .then((res) => setHabits(res.data.habits))
+      .then((res) => setHabits(res.data.habits ?? []))
       .catch(() => {})
       .finally(() => setLoading(false))
   }, []) // eslint-disable-line react-hooks/exhaustive-deps

@@ -22,8 +22,8 @@ services:
   # ── go-redis (custom Redis-compatible server) ───────────────────────────────
   go-redis:
     build:
-      context: ./services/go-redis
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: go-redis.Dockerfile
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -70,6 +70,18 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+
+  # ── pgAdmin ─────────────────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
 
 volumes:
   pgdata:

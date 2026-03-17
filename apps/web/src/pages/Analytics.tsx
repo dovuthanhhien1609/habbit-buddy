@@ -51,7 +51,9 @@ export function Analytics() {
 
   useEffect(() => {
     habitApi.getAnalytics()
-      .then((res) => setHabits(res.data.habits as HabitWithHistory[]))
+      .then((res) => setHabits(
+        (res.data.habits ?? []).map((h) => ({ ...h, history: h.history ?? [] })) as HabitWithHistory[]
+      ))
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])

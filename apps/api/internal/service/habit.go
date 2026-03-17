@@ -267,6 +267,9 @@ func (s *HabitService) getEnrichedHabits(userID string) ([]model.Habit, error) {
 	if err == nil && found {
 		var habits []model.Habit
 		if json.Unmarshal([]byte(cached), &habits) == nil {
+			if habits == nil {
+				habits = []model.Habit{}
+			}
 			return habits, nil
 		}
 	}
@@ -275,6 +278,9 @@ func (s *HabitService) getEnrichedHabits(userID string) ([]model.Habit, error) {
 	habits, err := s.habitRepo.GetActiveByUserID(userID)
 	if err != nil {
 		return nil, err
+	}
+	if habits == nil {
+		habits = []model.Habit{}
 	}
 
 	today := time.Now().UTC().Format("2006-01-02")
