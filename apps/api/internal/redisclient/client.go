@@ -10,11 +10,13 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client is a connection to the go-redis server.
 type Client struct {
+	mu     sync.Mutex
 	addr   string
 	conn   net.Conn
 	reader *bufio.Reader
@@ -100,6 +102,8 @@ func (c *Client) Incr(key string) (int64, error) {
 
 // do executes a command and returns the response as a string.
 func (c *Client) do(args ...string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err := c.send(args...); err != nil {
 		return "", err
 	}
@@ -115,6 +119,8 @@ func (c *Client) do(args ...string) (string, error) {
 
 // doRaw executes a command and returns a nullable string pointer.
 func (c *Client) doRaw(args ...string) (*string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err := c.send(args...); err != nil {
 		return nil, err
 	}

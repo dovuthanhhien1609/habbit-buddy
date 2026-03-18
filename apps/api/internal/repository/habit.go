@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/habit-buddy/api/internal/model"
 )
 
@@ -230,8 +231,6 @@ func (r *HabitRepository) GetTotalCompletions(habitID string) (int, error) {
 	return count, err
 }
 
-// newUUID is a simple wrapper — we use google/uuid in service layer,
-// but keep repository import-clean.
 func newUUID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano()) // placeholder, overridden by caller
+	return uuid.New().String()
 }
