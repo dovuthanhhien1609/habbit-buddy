@@ -49,6 +49,7 @@ redis-cli -p 6379 GET hb:user:<userId>:daily:$(date +%Y-%m-%d)
 redis-cli -p 6379 KEYS "hb:*"
 
 # Watch pub/sub events live (open before clicking "Mark done")
+# Each message is a JSON envelope: {user_id, event{event_id, event_type, timestamp, producer, payload}}
 redis-cli -p 6379 SUBSCRIBE hb:events
 ```
 
@@ -70,13 +71,13 @@ docker compose logs go-redis -f
 ## Talking Points
 
 **Architecture:**
-> "The backend is Go with a Chi router. When a habit is completed, it writes to PostgreSQL for durability, updates the streak counter in our custom go-redis server, then publishes an event to a Redis pub/sub channel."
+> "The backend is Go with a Chi router. When a habit is completed, it writes to PostgreSQL for durability, updates the streak counter in our custom go-redis server, then publishes a structured event — with a UUID, type, timestamp, and producer — to a Redis pub/sub channel. All components emit structured JSON logs so you can trace an event from the HTTP request all the way to the WebSocket client."
 
 **go-redis:**
 > "go-redis is a Redis-compatible server built from scratch in Go. It speaks the RESP v2 protocol over TCP, supports strings, hashes, counters, key expiry, pub/sub, and an append-only file for persistence. It lives in the repo as a git submodule."
 
 **Realtime:**
-> "The second tab just updated without any manual refresh. The backend publishes a JSON event to go-redis on the `hb:events` channel. An EventBridge goroutine subscribed to that channel picks it up and fans it out to all open WebSocket connections for that user. Because the event goes through Redis, you could run multiple API instances and every instance would receive and deliver it."
+> "The second tab just updated without any manual refresh. When a habit is completed, the handler builds a canonical event — a UUID, event type like `habit.completed`, a UTC timestamp, and a payload — and publishes it to go-redis on the `hb:events` channel. An EventBridge goroutine subscribed to that channel deduplicates by event ID and fans it out to all open WebSocket connections for that user. Because the event goes through Redis, you could run multiple API instances and every instance would receive and deliver it exactly once."
 
 **Key design:**
 > "The streak counter lives in go-redis as a plain string key: `hb:habit:{id}:streak`. It's O(1) to read, which is why dashboard loads are fast even with many habits."

@@ -3,7 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -11,6 +11,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/habit-buddy/api/internal/api"
+	_ "github.com/habit-buddy/api/internal/logger" // init JSON structured logger
 	"github.com/habit-buddy/api/internal/redisclient"
 	"github.com/habit-buddy/api/internal/repository"
 	"github.com/habit-buddy/api/internal/service"
@@ -26,7 +27,8 @@ func main() {
 
 	// Run migrations
 	if err := runMigrations(db); err != nil {
-		log.Fatalf("migration failed: %v", err)
+		slog.Error("migration failed", "error", err)
+		os.Exit(1)
 	}
 
 	// Connect to go-redis
@@ -43,7 +45,8 @@ func main() {
 
 	bridge, err := ws.NewEventBridge(cfg.RedisAddr, hub)
 	if err != nil {
-		log.Fatalf("event bridge failed: %v", err)
+		slog.Error("event bridge failed", "error", err)
+		os.Exit(1)
 	}
 	defer bridge.Close()
 
@@ -53,11 +56,11 @@ func main() {
 	router := api.NewRouter(authHandler, habitHandler, hub, cfg.JWTSecret)
 
 	addr := ":" + cfg.Port
-	log.Printf("habit-buddy API listening on %s", addr)
-	log.Printf("go-redis connected at %s", cfg.RedisAddr)
+	slog.Info("habit-buddy API starting", "addr", addr, "redis_addr", cfg.RedisAddr)
 
 	if err := http.ListenAndServe(addr, router); err != nil {
-		log.Fatalf("server error: %v", err)
+		slog.Error("server error", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -95,14 +98,15 @@ func mustConnectDB(url string) *sql.DB {
 				db.SetMaxOpenConns(25)
 				db.SetMaxIdleConns(5)
 				db.SetConnMaxLifetime(5 * time.Minute)
-				log.Println("connected to PostgreSQL")
+				slog.Info("connected to PostgreSQL")
 				return db
 			}
 		}
-		log.Printf("waiting for postgres (%d/10): %v", i+1, err)
+		slog.Warn("waiting for postgres", "attempt", i+1, "error", err)
 		time.Sleep(2 * time.Second)
 	}
-	log.Fatalf("could not connect to postgres: %v", err)
+	slog.Error("could not connect to postgres", "error", err)
+	os.Exit(1)
 	return nil
 }
 
@@ -113,13 +117,14 @@ func mustConnectRedis(addr string) *redisclient.Client {
 	for i := 0; i < 10; i++ {
 		client, err = redisclient.NewClient(addr)
 		if err == nil {
-			log.Printf("connected to go-redis at %s", addr)
+			slog.Info("connected to go-redis", "addr", addr)
 			return client
 		}
-		log.Printf("waiting for go-redis (%d/10): %v", i+1, err)
+		slog.Warn("waiting for go-redis", "attempt", i+1, "error", err)
 		time.Sleep(2 * time.Second)
 	}
-	log.Fatalf("could not connect to go-redis: %v", err)
+	slog.Error("could not connect to go-redis", "error", err)
+	os.Exit(1)
 	return nil
 }
 
@@ -131,6 +136,6 @@ func runMigrations(db *sql.DB) error {
 	if _, err := db.Exec(string(migration)); err != nil {
 		return fmt.Errorf("exec migration: %w", err)
 	}
-	log.Println("migrations applied")
+	slog.Info("migrations applied")
 	return nil
 }

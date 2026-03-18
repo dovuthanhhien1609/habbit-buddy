@@ -2,12 +2,13 @@ package ws
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/habit-buddy/api/internal/logger"
 )
 
 const (
@@ -41,6 +42,7 @@ type Hub struct {
 
 	register   chan *Client
 	unregister chan *Client
+	log        *slog.Logger
 }
 
 // NewHub creates a new Hub.
@@ -49,6 +51,7 @@ func NewHub() *Hub {
 		clients:    make(map[string]map[*Client]bool),
 		register:   make(chan *Client, 64),
 		unregister: make(chan *Client, 64),
+		log:        logger.L.With("component", "ws_hub"),
 	}
 }
 
@@ -63,7 +66,7 @@ func (h *Hub) Run() {
 			}
 			h.clients[c.userID][c] = true
 			h.mu.Unlock()
-			log.Printf("ws: client registered userID=%s", c.userID)
+			h.log.Info("client registered", "user_id", c.userID)
 
 		case c := <-h.unregister:
 			h.mu.Lock()
@@ -75,16 +78,16 @@ func (h *Hub) Run() {
 			}
 			h.mu.Unlock()
 			close(c.send)
-			log.Printf("ws: client unregistered userID=%s", c.userID)
+			h.log.Info("client unregistered", "user_id", c.userID)
 		}
 	}
 }
 
 // BroadcastToUser sends a message to every WS client for a given userID.
-func (h *Hub) BroadcastToUser(userID string, msg interface{}) {
+func (h *Hub) BroadcastToUser(userID string, msg any) {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("ws: marshal error: %v", err)
+		h.log.Error("marshal error", "error", err, "user_id", userID)
 		return
 	}
 
@@ -107,7 +110,7 @@ func (h *Hub) BroadcastToUser(userID string, msg interface{}) {
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, userID string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("ws: upgrade error: %v", err)
+		h.log.Error("upgrade error", "error", err, "user_id", userID)
 		return
 	}
 

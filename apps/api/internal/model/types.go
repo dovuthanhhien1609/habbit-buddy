@@ -51,9 +51,14 @@ type HabitStats struct {
 	History        []string `json:"history"` // dates completed in last 30 days
 }
 
+// WSEvent is the message delivered to WebSocket clients.
+// It mirrors the Event envelope so clients can deduplicate by event_id.
 type WSEvent struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
+	EventID   string      `json:"event_id"`
+	Type      string      `json:"type"`      // maps Event.EventType
+	Timestamp string      `json:"timestamp"` // RFC3339
+	Producer  string      `json:"producer"`
+	Payload   any `json:"payload"`
 }
 
 type HabitCompletedPayload struct {

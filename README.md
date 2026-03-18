@@ -21,9 +21,11 @@ flowchart LR
 
 **Key points:**
 - Realtime updates via WebSocket — completing a habit on Tab A updates Tab B instantly
+- Events follow a canonical schema (`event_id`, `event_type`, `timestamp`, `producer`, `payload`) and are deduplicated by the subscriber to prevent duplicate state mutations
 - Events flow through Redis pub/sub (`hb:events`), enabling horizontal scaling without sticky sessions
 - `go-redis` (git submodule at `services/go-redis`) handles caching, streak counters, daily analytics, and realtime event fan-out
 - PostgreSQL is the source of truth; go-redis caches hot data and brokers events
+- All components emit structured JSON logs (`log/slog`) covering the full event lifecycle
 
 ## Quick Start
 
@@ -87,20 +89,35 @@ WS     /ws?token=<jwt>
 
 ```mermaid
 flowchart TB
-    Handler["HTTP handler\nCompleteHabit"]
+    Handler["HTTP handler\nCompleteHabit\nbuild Event{event_id, …}"]
     PG["PostgreSQL\nwrite habit_completion"]
     RedisKey["go-redis\nupdate streak key"]
     Publish["go-redis\nPUBLISH hb:events"]
-    Bridge["EventBridge.run()\nsubscribed on startup"]
-    Hub["hub.BroadcastToUser\n(userID, event)"]
+    Bridge["EventBridge.run()\ndeduplicates by event_id\nsubscribed on startup"]
+    Hub["hub.BroadcastToUser\n(userID, WSEvent)"]
     WS["WebSocket clients\nall open tabs for that user"]
 
     Handler --> PG
     Handler --> RedisKey
     Handler --> Publish
     Publish -->|"hb:events message"| Bridge
+    Bridge -->|"drop if duplicate"| Bridge
     Bridge --> Hub
     Hub --> WS
+```
+
+**Event envelope** (`hb:events` pub/sub payload):
+```json
+{
+  "user_id": "…",
+  "event": {
+    "event_id":   "uuid-v4",
+    "event_type": "habit.completed",
+    "timestamp":  "2026-03-18T09:15:30Z",
+    "producer":   "api",
+    "payload":    { "habitId": "…", "habitName": "Morning Run", "streak": 7, "completedAt": "…" }
+  }
+}
 ```
 
 ## Development (without Docker)
