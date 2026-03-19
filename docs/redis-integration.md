@@ -117,13 +117,13 @@ type Event struct {
   "event": {
     "event_id":   "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
     "event_type": "habit.completed",
-    "timestamp":  "2026-03-18T09:15:30Z",
+    "timestamp":  "2026-03-19T09:15:30Z",
     "producer":   "api",
     "payload": {
       "habitId":     "habit-xyz-789",
       "habitName":   "Morning Run",
       "streak":      7,
-      "completedAt": "2026-03-18T09:15:30Z"
+      "completedAt": "2026-03-19T09:15:30Z"
     }
   }
 }
@@ -131,19 +131,19 @@ type Event struct {
 
 ### WebSocket message delivered to clients
 
-The bridge reconstructs a `WSEvent` from the envelope. Clients receive:
+The `WSBroadcastHandler` converts the `Event` into a `WSEvent`. Clients receive:
 
 ```json
 {
   "event_id":   "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "type":       "habit.completed",
-  "timestamp":  "2026-03-18T09:15:30Z",
+  "timestamp":  "2026-03-19T09:15:30Z",
   "producer":   "api",
   "payload": {
     "habitId":     "habit-xyz-789",
     "habitName":   "Morning Run",
     "streak":      7,
-    "completedAt": "2026-03-18T09:15:30Z"
+    "completedAt": "2026-03-19T09:15:30Z"
   }
 }
 ```
@@ -152,65 +152,140 @@ The bridge reconstructs a `WSEvent` from the envelope. Clients receive:
 
 ## Idempotency & Deduplication
 
-`EventBridge` maintains an in-memory ring buffer (`seenCache`, capacity 1000) of recently processed `event_id` values. If the same event is delivered more than once — e.g. due to a Redis reconnect or a replayed message — it is silently dropped before reaching the WebSocket hub.
+`EventBridge` maintains an in-memory ring buffer (`seenCache`, capacity 1000) of recently processed `event_id` values. If the same event is delivered more than once — e.g. due to a Redis reconnect or a replayed message — it is silently dropped **before** reaching the router.
 
 ```
-event received → check seenCache(event_id)
-                      ├─ seen   → drop, log "duplicate event dropped"
-                      └─ unseen → record, broadcast to hub
+event received → seenCache.seen(event_id)
+                      ├─ true  → drop, log "duplicate event dropped"
+                      └─ false → record ID, forward to Router
 ```
 
 The ring buffer evicts the oldest entry when full, so memory usage is bounded and requires no external TTL management.
 
 ---
 
-## Realtime Pub/Sub Architecture
+## Realtime Architecture
 
-Completing a habit triggers a Redis-routed event instead of a direct in-process broadcast. This decouples the HTTP handler from the WebSocket hub and allows multiple API instances to each fan-out to their own clients.
+### Layer diagram
 
 ```mermaid
 flowchart TB
-    Handler["HTTP handler\nbuild Event{event_id, event_type, …}"]
-    Publish["client.Publish\nhb:events · JSON envelope"]
-    Broker["go-redis broker\nfan-out to all subscribers\n(RESP pub/sub wire protocol)"]
-    Bridge["EventBridge.run()\ndeduplicates by event_id\nvia redisclient.Subscriber"]
-    Hub["hub.BroadcastToUser\n(userID, WSEvent)"]
-    WS["All open WS tabs\nreceive full event envelope"]
+    subgraph Transport
+        Handler["HTTP Handler\nbuild Event{event_id, …}"]
+        Publish["redisclient.Publish\nhb:events"]
+        Broker["go-redis\nRESP pub/sub broker"]
+        Bridge["EventBridge\nsubscribe + dedup"]
+    end
+
+    subgraph Routing["Event Routing (internal/events)"]
+        Router["Router\nmap[event_type] → []Handler\n+ exponential backoff retry"]
+        WSHandler["WSBroadcastHandler\nconverts Event → WSEvent"]
+    end
+
+    subgraph Hub["WS Hub (internal/ws)"]
+        Channels["channel map\nuser:{id} · habit:{id} · team:{id}"]
+        Clients["WebSocket Clients"]
+    end
 
     Handler -->|"bridge.Publish(userID, Event)"| Publish
     Publish --> Broker
-    Broker --> Bridge
+    Broker -->|"hb:events push"| Bridge
     Bridge -->|"drop if duplicate"| Bridge
-    Bridge --> Hub
-    Hub --> WS
+    Bridge -->|"Router.Route(EventContext)"| Router
+    Router -->|"Handler.Handle (+ retry)"| WSHandler
+    WSHandler -->|"BroadcastToChannel(user:{id})"| Channels
+    WSHandler -->|"BroadcastToChannel(habit:{id})"| Channels
+    Channels --> Clients
 ```
 
-**Key files:**
+### Separation of concerns
+
+| Layer | Package | Responsibility |
+|-------|---------|----------------|
+| Transport | `internal/ws/bridge.go` | Redis subscribe/publish, envelope decode, deduplication |
+| Routing | `internal/events/router.go` | Dispatch by event_type, retry on failure |
+| Business logic | `internal/events/handlers.go` | Decide target channels, build WSEvent |
+| Fan-out | `internal/ws/hub.go` | Channel subscriptions, write to WS connections |
+
+### Key files
 
 | File | Role |
 |------|------|
 | `internal/model/event.go` | `Event` struct + event type constants |
 | `internal/model/types.go` | `WSEvent` — wire format sent to WS clients |
-| `internal/redisclient/client.go` | `Publish(channel, message)` method |
-| `internal/redisclient/subscriber.go` | `Subscriber` — dedicated pub/sub connection, decodes RESP push frames |
-| `internal/ws/bridge.go` | `EventBridge` — subscribes to `hb:events`, deduplicates, routes to WS hub |
-| `internal/ws/hub.go` | Local per-process WebSocket fan-out |
-| `internal/api/handlers.go` | Builds `Event` with UUID + timestamp, calls `bridge.Publish` |
+| `internal/redisclient/client.go` | `Publish(channel, message)` |
+| `internal/redisclient/subscriber.go` | Dedicated pub/sub TCP connection |
+| `internal/ws/bridge.go` | Transport layer — Redis → Router |
+| `internal/events/router.go` | `Router` + `RetryPolicy` |
+| `internal/events/handlers.go` | `WSBroadcastHandler`, `Broadcaster` interface |
+| `internal/ws/hub.go` | Channel-based WS fan-out |
+| `internal/api/handlers.go` | Builds `Event`, calls `bridge.Publish` |
+
+---
+
+## WebSocket Channel Subscriptions
+
+The Hub uses named channels instead of broadcasting to all clients.
+
+### Channel patterns
+
+| Channel | Managed by | Purpose |
+|---------|-----------|---------|
+| `user:{id}` | Server (auto on connect) | All events for a user |
+| `habit:{id}` | Client (opt-in) | Events scoped to one habit |
+| `team:{id}` | Client (opt-in) | Reserved for team-level fan-out |
+
+### Client subscription protocol
+
+After connecting, a client is automatically subscribed to `user:{their-id}`. To opt into habit-scoped updates, send a JSON control message over the WebSocket:
+
+```json
+{ "action": "subscribe",   "channel": "habit:abc123" }
+{ "action": "unsubscribe", "channel": "habit:abc123" }
+```
+
+Clients cannot subscribe to `user:{id}` channels — those are server-managed only.
+
+---
+
+## Retry Mechanism
+
+`Router.withRetry` wraps every handler call with exponential backoff:
+
+```
+attempt 1 → error → wait 100 ms
+attempt 2 → error → wait 200 ms
+attempt 3 → error → log "handler failed after all retries"
+```
+
+The policy is configurable:
+
+```go
+events.NewRouter(events.RetryPolicy{MaxAttempts: 3, BaseDelay: 100 * time.Millisecond})
+```
 
 ---
 
 ## Structured Logging
 
-All components use `log/slog` with a JSON handler (initialized in `internal/logger/logger.go`). Every stage of the event lifecycle emits a structured log line:
+All components use `log/slog` JSON output (initialized in `internal/logger/logger.go`).
+Every stage of the event lifecycle emits a structured log line:
 
 ```json
-{"time":"2026-03-18T09:15:30Z","level":"INFO","msg":"publishing event",              "component":"habit_handler", "event_id":"a1b2…","event_type":"habit.completed","habit_id":"…","user_id":"…"}
-{"time":"2026-03-18T09:15:30Z","level":"INFO","msg":"event published to Redis",       "component":"event_bridge",  "event_id":"a1b2…","event_type":"habit.completed","user_id":"…","producer":"api"}
-{"time":"2026-03-18T09:15:30Z","level":"INFO","msg":"event received from Redis subscriber","component":"event_bridge","event_id":"a1b2…","event_type":"habit.completed","user_id":"…","producer":"api"}
-{"time":"2026-03-18T09:15:30Z","level":"INFO","msg":"broadcasting event to WebSocket clients","component":"event_bridge","event_id":"a1b2…","event_type":"habit.completed","user_id":"…"}
+{"level":"INFO","msg":"publishing event",                    "component":"habit_handler",       "event_id":"…","event_type":"habit.completed","habit_id":"…","user_id":"…"}
+{"level":"INFO","msg":"event published to Redis",            "component":"event_bridge",        "event_id":"…","event_type":"habit.completed","user_id":"…","producer":"api"}
+{"level":"INFO","msg":"event received from Redis",           "component":"event_bridge",        "event_id":"…","event_type":"habit.completed","user_id":"…","producer":"api"}
+{"level":"INFO","msg":"routing event",                       "component":"event_router",        "event_id":"…","event_type":"habit.completed","user_id":"…","handler_count":1}
+{"level":"INFO","msg":"broadcast to user channel",           "component":"ws_broadcast_handler","event_id":"…","channel":"user:…"}
+{"level":"INFO","msg":"broadcast to habit channel",          "component":"ws_broadcast_handler","event_id":"…","channel":"habit:…"}
 ```
 
-Duplicate events produce:
+Retry warnings:
 ```json
-{"time":"…","level":"INFO","msg":"duplicate event dropped","component":"event_bridge","event_id":"a1b2…","event_type":"habit.completed"}
+{"level":"WARN","msg":"handler error, will retry","component":"event_router","event_id":"…","attempt":1,"max_attempts":3,"retry_in":"100ms","error":"…"}
+```
+
+Duplicate events:
+```json
+{"level":"INFO","msg":"duplicate event dropped","component":"event_bridge","event_id":"…","event_type":"habit.completed"}
 ```

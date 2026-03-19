@@ -1,11 +1,13 @@
 package ws
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 
+	"github.com/habit-buddy/api/internal/events"
 	"github.com/habit-buddy/api/internal/logger"
 	"github.com/habit-buddy/api/internal/model"
 	"github.com/habit-buddy/api/internal/redisclient"
@@ -23,7 +25,7 @@ type envelope struct {
 
 // seenCache is a fixed-size in-memory deduplication ring buffer.
 // It keeps the last `size` event IDs so that replayed or duplicate
-// messages are silently dropped without hitting the database.
+// messages are silently dropped before reaching the router.
 type seenCache struct {
 	mu   sync.Mutex
 	ids  map[string]struct{}
@@ -40,15 +42,13 @@ func newSeenCache(size int) *seenCache {
 	}
 }
 
-// seen returns true if id was already observed, otherwise it records id and
-// returns false.
+// seen returns true if id was already observed, otherwise records it and returns false.
 func (c *seenCache) seen(id string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.ids[id]; ok {
 		return true
 	}
-	// Evict the oldest entry when the ring is full.
 	if old := c.ring[c.head]; old != "" {
 		delete(c.ids, old)
 	}
@@ -58,24 +58,27 @@ func (c *seenCache) seen(id string) bool {
 	return false
 }
 
-// EventBridge subscribes to the Redis event channel and fans out events
-// to the local WebSocket hub. It also exposes Publish so that HTTP handlers
-// can emit events without directly coupling to the hub.
+// EventBridge is the transport layer between Redis pub/sub and the event router.
 //
-// Using Redis pub/sub as the transport means multiple API instances can each
-// subscribe to the same channel and broadcast to their own set of WS clients,
-// enabling horizontal scaling without sticky sessions.
+// Responsibilities:
+//   - Maintain two Redis connections: one for SUBSCRIBE, one for PUBLISH.
+//   - Deduplicate events by event_id before forwarding.
+//   - Decode the Redis envelope and pass an EventContext to the router.
+//   - Expose Publish so HTTP handlers can emit events without knowing about the hub.
+//
+// The bridge is intentionally free of business logic — it delegates all
+// routing and handler dispatch to the injected events.Router.
 type EventBridge struct {
-	hub  *Hub
-	sub  *redisclient.Subscriber
-	pub  *redisclient.Client
-	seen *seenCache
-	log  *slog.Logger
+	router *events.Router
+	sub    *redisclient.Subscriber
+	pub    *redisclient.Client
+	seen   *seenCache
+	log    *slog.Logger
 }
 
 // NewEventBridge creates an EventBridge and starts the background listener.
-// It opens two connections to redisAddr: one for subscribing, one for publishing.
-func NewEventBridge(redisAddr string, hub *Hub) (*EventBridge, error) {
+// It opens two TCP connections to redisAddr: one for subscribing, one for publishing.
+func NewEventBridge(redisAddr string, router *events.Router) (*EventBridge, error) {
 	sub, err := redisclient.NewSubscriber(redisAddr)
 	if err != nil {
 		return nil, fmt.Errorf("event bridge: subscriber: %w", err)
@@ -91,19 +94,18 @@ func NewEventBridge(redisAddr string, hub *Hub) (*EventBridge, error) {
 		return nil, fmt.Errorf("event bridge: subscribe: %w", err)
 	}
 	b := &EventBridge{
-		hub:  hub,
-		sub:  sub,
-		pub:  pub,
-		seen: newSeenCache(1000),
-		log:  logger.L.With("component", "event_bridge"),
+		router: router,
+		sub:    sub,
+		pub:    pub,
+		seen:   newSeenCache(1000),
+		log:    logger.L.With("component", "event_bridge"),
 	}
 	go b.run()
 	return b, nil
 }
 
-// Publish marshals event and publishes it to the Redis event channel for userID.
-// All API instances (including this one) will receive it and broadcast to their
-// local WebSocket clients for that user.
+// Publish encodes event into an envelope and publishes it to the Redis channel.
+// All API instances subscribed to hb:events will receive and route the message.
 func (b *EventBridge) Publish(userID string, event model.Event) error {
 	env := envelope{UserID: userID, Event: event}
 	data, err := json.Marshal(env)
@@ -128,18 +130,19 @@ func (b *EventBridge) Close() error {
 	return b.sub.Close()
 }
 
-// run reads messages from the subscriber and broadcasts each event to the hub.
+// run reads messages from the subscriber, deduplicates them, and forwards to the router.
 func (b *EventBridge) run() {
+	ctx := context.Background()
+
 	for msg := range b.sub.Messages() {
 		var env envelope
 		if err := json.Unmarshal([]byte(msg.Payload), &env); err != nil {
-			b.log.Error("event decode error", "error", err)
+			b.log.Error("envelope decode error", "error", err)
 			continue
 		}
 
 		evt := env.Event
 
-		// Idempotency: drop events whose ID has already been processed.
 		if b.seen.seen(evt.EventID) {
 			b.log.Info("duplicate event dropped",
 				"event_id", evt.EventID,
@@ -148,28 +151,16 @@ func (b *EventBridge) run() {
 			continue
 		}
 
-		b.log.Info("event received from Redis subscriber",
+		b.log.Info("event received from Redis",
 			"event_id", evt.EventID,
 			"event_type", evt.EventType,
 			"user_id", env.UserID,
 			"producer", evt.Producer,
 		)
 
-		// Build the WS wire message delivered to clients.
-		wsEvent := model.WSEvent{
-			EventID:   evt.EventID,
-			Type:      evt.EventType,
-			Timestamp: evt.Timestamp.UTC().Format("2006-01-02T15:04:05Z07:00"),
-			Producer:  evt.Producer,
-			Payload:   evt.Payload,
-		}
-
-		b.log.Info("broadcasting event to WebSocket clients",
-			"event_id", evt.EventID,
-			"event_type", evt.EventType,
-			"user_id", env.UserID,
-		)
-
-		b.hub.BroadcastToUser(env.UserID, wsEvent)
+		b.router.Route(ctx, events.EventContext{
+			UserID: env.UserID,
+			Event:  evt,
+		})
 	}
 }

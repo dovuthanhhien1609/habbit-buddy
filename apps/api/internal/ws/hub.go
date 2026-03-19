@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +16,7 @@ const (
 	writeWait  = 10 * time.Second
 	pongWait   = 60 * time.Second
 	pingPeriod = (pongWait * 9) / 10
-	maxMsgSize = 512
+	maxMsgSize = 1024
 )
 
 var upgrader = websocket.Upgrader{
@@ -34,12 +35,21 @@ type Client struct {
 	send   chan []byte
 }
 
-// Hub maintains the set of active clients grouped by userID.
+// Hub manages channel-based WebSocket subscriptions.
+//
+// Supported channel patterns:
+//   - "user:{id}"  — automatically subscribed on connect; delivers events for that user.
+//   - "habit:{id}" — client-initiated via subscription message; delivers habit-scoped events.
+//   - "team:{id}"  — client-initiated; reserved for future team-level fan-out.
+//
+// Clients are NOT broadcast to blindly — only channels they are subscribed to receive messages.
 type Hub struct {
-	// clients maps userID → set of active clients
-	clients map[string]map[*Client]bool
-	mu      sync.RWMutex
+	// channels maps channel name → set of subscribed clients.
+	channels map[string]map[*Client]bool
+	// clientChans maps each client → its subscribed channels (for O(1) cleanup).
+	clientChans map[*Client]map[string]bool
 
+	mu         sync.RWMutex
 	register   chan *Client
 	unregister chan *Client
 	log        *slog.Logger
@@ -48,10 +58,11 @@ type Hub struct {
 // NewHub creates a new Hub.
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]map[*Client]bool),
-		register:   make(chan *Client, 64),
-		unregister: make(chan *Client, 64),
-		log:        logger.L.With("component", "ws_hub"),
+		channels:    make(map[string]map[*Client]bool),
+		clientChans: make(map[*Client]map[string]bool),
+		register:    make(chan *Client, 64),
+		unregister:  make(chan *Client, 64),
+		log:         logger.L.With("component", "ws_hub"),
 	}
 }
 
@@ -61,21 +72,24 @@ func (h *Hub) Run() {
 		select {
 		case c := <-h.register:
 			h.mu.Lock()
-			if h.clients[c.userID] == nil {
-				h.clients[c.userID] = make(map[*Client]bool)
+			if h.clientChans[c] == nil {
+				h.clientChans[c] = make(map[string]bool)
 			}
-			h.clients[c.userID][c] = true
 			h.mu.Unlock()
 			h.log.Info("client registered", "user_id", c.userID)
 
 		case c := <-h.unregister:
 			h.mu.Lock()
-			if set, ok := h.clients[c.userID]; ok {
-				delete(set, c)
-				if len(set) == 0 {
-					delete(h.clients, c.userID)
+			// Remove the client from every channel it is subscribed to.
+			for ch := range h.clientChans[c] {
+				if set := h.channels[ch]; set != nil {
+					delete(set, c)
+					if len(set) == 0 {
+						delete(h.channels, ch)
+					}
 				}
 			}
+			delete(h.clientChans, c)
 			h.mu.Unlock()
 			close(c.send)
 			h.log.Info("client unregistered", "user_id", c.userID)
@@ -83,30 +97,67 @@ func (h *Hub) Run() {
 	}
 }
 
-// BroadcastToUser sends a message to every WS client for a given userID.
-func (h *Hub) BroadcastToUser(userID string, msg any) {
+// Subscribe adds c to the named channel.
+// Safe to call concurrently with Run.
+func (h *Hub) Subscribe(c *Client, channel string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.channels[channel] == nil {
+		h.channels[channel] = make(map[*Client]bool)
+	}
+	h.channels[channel][c] = true
+	if h.clientChans[c] == nil {
+		h.clientChans[c] = make(map[string]bool)
+	}
+	h.clientChans[c][channel] = true
+	h.log.Info("client subscribed to channel", "user_id", c.userID, "channel", channel)
+}
+
+// Unsubscribe removes c from the named channel.
+func (h *Hub) Unsubscribe(c *Client, channel string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if set := h.channels[channel]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(h.channels, channel)
+		}
+	}
+	if chans := h.clientChans[c]; chans != nil {
+		delete(chans, channel)
+	}
+	h.log.Info("client unsubscribed from channel", "user_id", c.userID, "channel", channel)
+}
+
+// BroadcastToChannel sends msg to every client subscribed to channel.
+// Clients whose send buffer is full are disconnected.
+func (h *Hub) BroadcastToChannel(channel string, msg any) {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		h.log.Error("marshal error", "error", err, "user_id", userID)
+		h.log.Error("marshal error", "error", err, "channel", channel)
 		return
 	}
 
 	h.mu.RLock()
-	set := h.clients[userID]
+	set := h.channels[channel]
 	h.mu.RUnlock()
 
 	for c := range set {
 		select {
 		case c.send <- data:
 		default:
-			// Client's send buffer is full — drop and disconnect.
 			h.unregister <- c
 		}
 	}
 }
 
-// ServeWS upgrades the HTTP connection and registers the client.
-// The userID must be extracted from the JWT before calling this.
+// BroadcastToUser is a convenience wrapper that targets the "user:{userID}" channel.
+func (h *Hub) BroadcastToUser(userID string, msg any) {
+	h.BroadcastToChannel("user:"+userID, msg)
+}
+
+// ServeWS upgrades the HTTP connection, registers the client, and auto-subscribes
+// it to its "user:{userID}" channel.
 func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, userID string) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -121,12 +172,31 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, userID string) {
 		send:   make(chan []byte, 256),
 	}
 	h.register <- c
+	// Auto-subscribe to the user's personal channel immediately.
+	// This is the default delivery channel for all user-scoped events.
+	h.Subscribe(c, "user:"+userID)
 
 	go c.writePump()
 	go c.readPump()
 }
 
-// readPump reads incoming messages (we ignore them, only used for ping/pong).
+// subMessage is the JSON control message clients send to subscribe/unsubscribe.
+//
+//	{"action": "subscribe",   "channel": "habit:abc123"}
+//	{"action": "unsubscribe", "channel": "habit:abc123"}
+type subMessage struct {
+	Action  string `json:"action"`
+	Channel string `json:"channel"`
+}
+
+// isClientSubscribable returns true for channel patterns that clients may
+// manage themselves. "user:{id}" channels are server-managed only.
+func isClientSubscribable(channel string) bool {
+	return strings.HasPrefix(channel, "habit:") ||
+		strings.HasPrefix(channel, "team:")
+}
+
+// readPump reads control messages (subscribe/unsubscribe) and handles ping/pong.
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -141,9 +211,22 @@ func (c *Client) readPump() {
 	})
 
 	for {
-		_, _, err := c.conn.ReadMessage()
+		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			break
+		}
+		var msg subMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue // not a control message — ignore
+		}
+		if !isClientSubscribable(msg.Channel) {
+			continue // disallow user:{id} or unknown patterns
+		}
+		switch msg.Action {
+		case "subscribe":
+			c.hub.Subscribe(c, msg.Channel)
+		case "unsubscribe":
+			c.hub.Unsubscribe(c, msg.Channel)
 		}
 	}
 }

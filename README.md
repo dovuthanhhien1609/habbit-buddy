@@ -15,13 +15,15 @@ flowchart LR
     Backend -->|"SQL"| PG
     Backend -->|"RESP (cache + counters)"| Redis
     Backend -->|"RESP pub/sub PUBLISH"| Redis
-    Redis -->|"hb:events → WS hub"| Backend
-    Backend -->|"WebSocket push"| Browser
+    Redis -->|"hb:events → EventBridge → Router → Hub"| Backend
+    Backend -->|"WebSocket push\n(channel-based)"| Browser
 ```
 
 **Key points:**
 - Realtime updates via WebSocket — completing a habit on Tab A updates Tab B instantly
-- Events follow a canonical schema (`event_id`, `event_type`, `timestamp`, `producer`, `payload`) and are deduplicated by the subscriber to prevent duplicate state mutations
+- Events follow a canonical schema (`event_id`, `event_type`, `timestamp`, `producer`, `payload`) and are deduplicated before routing
+- A dedicated **Event Router** layer dispatches by `event_type` with exponential backoff retry — transport and business logic are fully decoupled
+- WebSocket Hub uses **named channel subscriptions** (`user:{id}`, `habit:{id}`, `team:{id}`) — no blind broadcasts
 - Events flow through Redis pub/sub (`hb:events`), enabling horizontal scaling without sticky sessions
 - `go-redis` (git submodule at `services/go-redis`) handles caching, streak counters, daily analytics, and realtime event fan-out
 - PostgreSQL is the source of truth; go-redis caches hot data and brokers events
@@ -89,21 +91,41 @@ WS     /ws?token=<jwt>
 
 ```mermaid
 flowchart TB
-    Handler["HTTP handler\nCompleteHabit\nbuild Event{event_id, …}"]
+    Handler["HTTP Handler\nbuild Event{event_id, event_type, …}"]
     PG["PostgreSQL\nwrite habit_completion"]
     RedisKey["go-redis\nupdate streak key"]
     Publish["go-redis\nPUBLISH hb:events"]
-    Bridge["EventBridge.run()\ndeduplicates by event_id\nsubscribed on startup"]
-    Hub["hub.BroadcastToUser\n(userID, WSEvent)"]
-    WS["WebSocket clients\nall open tabs for that user"]
+
+    subgraph Bridge["Transport — EventBridge"]
+        Dedup["seenCache\ndeduplicate by event_id"]
+    end
+
+    subgraph Routing["Event Router"]
+        Router["Router.Route()\ndispatch by event_type"]
+        Retry["exponential backoff retry\n100ms → 200ms → 400ms"]
+        WSH["WSBroadcastHandler"]
+    end
+
+    subgraph Hub["WS Hub — channel-based"]
+        UCh["user:{id}"]
+        HCh["habit:{id}"]
+        TCh["team:{id}"]
+        WS["WebSocket clients"]
+    end
 
     Handler --> PG
     Handler --> RedisKey
     Handler --> Publish
-    Publish -->|"hb:events message"| Bridge
-    Bridge -->|"drop if duplicate"| Bridge
-    Bridge --> Hub
-    Hub --> WS
+    Publish -->|"hb:events"| Dedup
+    Dedup -->|"drop if seen"| Dedup
+    Dedup -->|"EventContext"| Router
+    Router --> Retry
+    Retry --> WSH
+    WSH --> UCh
+    WSH --> HCh
+    UCh --> WS
+    HCh --> WS
+    TCh --> WS
 ```
 
 **Event envelope** (`hb:events` pub/sub payload):
@@ -113,11 +135,17 @@ flowchart TB
   "event": {
     "event_id":   "uuid-v4",
     "event_type": "habit.completed",
-    "timestamp":  "2026-03-18T09:15:30Z",
+    "timestamp":  "2026-03-19T09:15:30Z",
     "producer":   "api",
     "payload":    { "habitId": "…", "habitName": "Morning Run", "streak": 7, "completedAt": "…" }
   }
 }
+```
+
+**WS client subscription** (opt-in to habit-scoped events):
+```json
+{ "action": "subscribe",   "channel": "habit:abc123" }
+{ "action": "unsubscribe", "channel": "habit:abc123" }
 ```
 
 ## Development (without Docker)

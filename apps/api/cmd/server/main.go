@@ -11,7 +11,9 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/habit-buddy/api/internal/api"
+	"github.com/habit-buddy/api/internal/events"
 	_ "github.com/habit-buddy/api/internal/logger" // init JSON structured logger
+	"github.com/habit-buddy/api/internal/model"
 	"github.com/habit-buddy/api/internal/redisclient"
 	"github.com/habit-buddy/api/internal/repository"
 	"github.com/habit-buddy/api/internal/service"
@@ -21,44 +23,60 @@ import (
 func main() {
 	cfg := loadConfig()
 
-	// Connect to PostgreSQL with retry
 	db := mustConnectDB(cfg.DatabaseURL)
 	defer db.Close()
 
-	// Run migrations
 	if err := runMigrations(db); err != nil {
 		slog.Error("migration failed", "error", err)
 		os.Exit(1)
 	}
 
-	// Connect to go-redis
 	redis := mustConnectRedis(cfg.RedisAddr)
 	defer redis.Close()
 
-	// Build dependency graph
-	userRepo := repository.NewUserRepository(db)
-	habitRepo := repository.NewHabitRepository(db)
-	habitSvc := service.NewHabitService(habitRepo, redis)
-
+	// --- WebSocket hub ---
 	hub := ws.NewHub()
 	go hub.Run()
 
-	bridge, err := ws.NewEventBridge(cfg.RedisAddr, hub)
+	// --- Event router ---
+	// Wire the routing layer: each event_type maps to one or more handlers.
+	// WSBroadcastHandler fans out to hub channels; add further handlers here
+	// (e.g. analytics, notifications) without touching transport code.
+	router := events.NewRouter(events.DefaultRetryPolicy)
+	wsBroadcast := events.NewWSBroadcastHandler(hub)
+
+	for _, eventType := range []string{
+		model.EventHabitCompleted,
+		model.EventHabitUndone,
+		model.EventHabitCreated,
+		model.EventHabitUpdated,
+		model.EventHabitArchived,
+	} {
+		router.On(eventType, wsBroadcast)
+	}
+
+	// --- Event bridge (transport layer) ---
+	bridge, err := ws.NewEventBridge(cfg.RedisAddr, router)
 	if err != nil {
 		slog.Error("event bridge failed", "error", err)
 		os.Exit(1)
 	}
 	defer bridge.Close()
 
+	// --- HTTP handlers ---
+	userRepo := repository.NewUserRepository(db)
+	habitRepo := repository.NewHabitRepository(db)
+	habitSvc := service.NewHabitService(habitRepo, redis)
+
 	authHandler := api.NewAuthHandler(userRepo, cfg.JWTSecret)
 	habitHandler := api.NewHabitHandler(habitSvc, bridge)
 
-	router := api.NewRouter(authHandler, habitHandler, hub, cfg.JWTSecret)
+	httpRouter := api.NewRouter(authHandler, habitHandler, hub, cfg.JWTSecret)
 
 	addr := ":" + cfg.Port
 	slog.Info("habit-buddy API starting", "addr", addr, "redis_addr", cfg.RedisAddr)
 
-	if err := http.ListenAndServe(addr, router); err != nil {
+	if err := http.ListenAndServe(addr, httpRouter); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
@@ -90,7 +108,6 @@ func getEnv(key, fallback string) string {
 func mustConnectDB(url string) *sql.DB {
 	var db *sql.DB
 	var err error
-
 	for i := 0; i < 10; i++ {
 		db, err = sql.Open("postgres", url)
 		if err == nil {
@@ -113,7 +130,6 @@ func mustConnectDB(url string) *sql.DB {
 func mustConnectRedis(addr string) *redisclient.Client {
 	var client *redisclient.Client
 	var err error
-
 	for i := 0; i < 10; i++ {
 		client, err = redisclient.NewClient(addr)
 		if err == nil {
