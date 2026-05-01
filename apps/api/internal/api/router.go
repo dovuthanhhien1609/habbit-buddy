@@ -12,6 +12,7 @@ import (
 func NewRouter(
 	authHandler *AuthHandler,
 	habitHandler *HabitHandler,
+	reminderHandler *ReminderHandler,
 	hub *ws.Hub,
 	jwtSecret string,
 ) http.Handler {
@@ -67,6 +68,20 @@ func NewRouter(
 				r.Delete("/complete", habitHandler.UndoCompletion)
 				r.Get("/stats", habitHandler.GetStats)
 			})
+
+			// Reminder endpoints — nested under habit
+			r.Route("/{habitId}/reminders", func(r chi.Router) {
+				r.Get("/", reminderHandler.ListReminders)
+				r.Post("/", reminderHandler.CreateReminder)
+				r.Put("/{reminderId}", reminderHandler.UpdateReminder)
+				r.Delete("/{reminderId}", reminderHandler.DeleteReminder)
+			})
+		})
+
+		// Notification endpoints
+		r.Route("/api/notifications", func(r chi.Router) {
+			r.Get("/", reminderHandler.ListNotifications)
+			r.Post("/{id}/read", reminderHandler.MarkNotificationRead)
 		})
 	})
 

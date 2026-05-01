@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { Habit, User } from '../api/client'
+import { Notification } from '../types/notification'
 
 export interface Toast {
   id: string
@@ -17,6 +18,9 @@ interface Store {
   habits: Habit[]
   dashboardDate: string
 
+  // Notifications
+  notifications: Notification[]
+
   // UI
   toasts: Toast[]
 
@@ -29,6 +33,11 @@ interface Store {
   addToast: (toast: Omit<Toast, 'id'>) => void
   removeToast: (id: string) => void
   logout: () => void
+
+  // Notification actions
+  setNotifications: (ns: Notification[]) => void
+  addNotification: (n: Notification) => void
+  markNotificationRead: (id: string) => void
 }
 
 export const useStore = create<Store>((set) => ({
@@ -43,6 +52,7 @@ export const useStore = create<Store>((set) => ({
   })(),
   habits: [],
   dashboardDate: new Date().toISOString().slice(0, 10),
+  notifications: [],
   toasts: [],
 
   setToken: (token) => {
@@ -84,6 +94,20 @@ export const useStore = create<Store>((set) => ({
   logout: () => {
     localStorage.removeItem('hb_token')
     localStorage.removeItem('hb_user')
-    set({ token: null, user: null, habits: [] })
+    set({ token: null, user: null, habits: [], notifications: [] })
   },
+
+  setNotifications: (ns) => set({ notifications: ns }),
+
+  addNotification: (n) =>
+    set((state) => ({
+      notifications: [n, ...state.notifications],
+    })),
+
+  markNotificationRead: (id) =>
+    set((state) => ({
+      notifications: state.notifications.map((n) =>
+        n.id === id ? { ...n, read: true } : n
+      ),
+    })),
 }))

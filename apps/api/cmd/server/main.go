@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"github.com/habit-buddy/api/internal/model"
 	"github.com/habit-buddy/api/internal/redisclient"
 	"github.com/habit-buddy/api/internal/repository"
+	"github.com/habit-buddy/api/internal/scheduler"
 	"github.com/habit-buddy/api/internal/service"
 	"github.com/habit-buddy/api/internal/ws"
 )
@@ -51,6 +53,7 @@ func main() {
 		model.EventHabitCreated,
 		model.EventHabitUpdated,
 		model.EventHabitArchived,
+		model.EventReminder,
 	} {
 		router.On(eventType, wsBroadcast)
 	}
@@ -63,15 +66,25 @@ func main() {
 	}
 	defer bridge.Close()
 
-	// --- HTTP handlers ---
+	// --- Repositories ---
 	userRepo := repository.NewUserRepository(db)
 	habitRepo := repository.NewHabitRepository(db)
+	reminderRepo := repository.NewReminderRepository(db)
+	notifRepo := repository.NewNotificationRepository(db)
+
+	// --- Services ---
 	habitSvc := service.NewHabitService(habitRepo, redis)
 
+	// --- HTTP handlers ---
 	authHandler := api.NewAuthHandler(userRepo, cfg.JWTSecret)
 	habitHandler := api.NewHabitHandler(habitSvc, bridge)
+	reminderHandler := api.NewReminderHandler(reminderRepo, notifRepo)
 
-	httpRouter := api.NewRouter(authHandler, habitHandler, hub, cfg.JWTSecret)
+	// --- Reminder scheduler ---
+	sched := scheduler.NewReminderScheduler(reminderRepo, notifRepo, habitRepo, bridge)
+	go sched.Start(context.Background())
+
+	httpRouter := api.NewRouter(authHandler, habitHandler, reminderHandler, hub, cfg.JWTSecret)
 
 	addr := ":" + cfg.Port
 	slog.Info("habit-buddy API starting", "addr", addr, "redis_addr", cfg.RedisAddr)
@@ -145,13 +158,19 @@ func mustConnectRedis(addr string) *redisclient.Client {
 }
 
 func runMigrations(db *sql.DB) error {
-	migration, err := os.ReadFile("migrations/001_init.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+	migrations := []string{
+		"migrations/001_init.sql",
+		"migrations/002_reminders.sql",
 	}
-	if _, err := db.Exec(string(migration)); err != nil {
-		return fmt.Errorf("exec migration: %w", err)
+	for _, path := range migrations {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", path, err)
+		}
+		if _, err := db.Exec(string(data)); err != nil {
+			return fmt.Errorf("exec migration %s: %w", path, err)
+		}
+		slog.Info("migration applied", "file", path)
 	}
-	slog.Info("migrations applied")
 	return nil
 }

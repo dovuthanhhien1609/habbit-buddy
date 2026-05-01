@@ -1,20 +1,32 @@
 import { useEffect, useRef } from 'react'
 import { useStore } from '../store/useStore'
+import { Notification } from '../types/notification'
+
+interface HabitEventPayload {
+  habitId: string
+  habitName?: string
+  streak: number
+  completedAt?: string
+}
+
+interface ReminderEventPayload {
+  notificationId: string
+  userId: string
+  habitId: string
+  title: string
+  body: string
+}
 
 interface WSEvent {
   type: string
-  payload: {
-    habitId: string
-    habitName?: string
-    streak: number
-    completedAt?: string
-  }
+  payload: HabitEventPayload | ReminderEventPayload
 }
 
 export function useWebSocket() {
   const token = useStore((s) => s.token)
   const updateHabit = useStore((s) => s.updateHabit)
   const addToast = useStore((s) => s.addToast)
+  const addNotification = useStore((s) => s.addNotification)
   const wsRef = useRef<WebSocket | null>(null)
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const retryDelay = useRef(1000)
@@ -58,24 +70,48 @@ export function useWebSocket() {
 
     const handleEvent = (msg: WSEvent) => {
       if (msg.type === 'HABIT_COMPLETED') {
-        updateHabit(msg.payload.habitId, {
+        const p = msg.payload as HabitEventPayload
+        updateHabit(p.habitId, {
           completedToday: true,
-          streak: msg.payload.streak,
+          streak: p.streak,
         })
         addToast({
           type: 'success',
-          message: msg.payload.habitName
-            ? `${msg.payload.habitName} completed! 🔥 ${msg.payload.streak} day streak`
+          message: p.habitName
+            ? `${p.habitName} completed! 🔥 ${p.streak} day streak`
             : 'Habit completed!',
-          streak: msg.payload.streak,
+          streak: p.streak,
         })
       }
 
       if (msg.type === 'HABIT_UNDONE') {
-        updateHabit(msg.payload.habitId, {
+        const p = msg.payload as HabitEventPayload
+        updateHabit(p.habitId, {
           completedToday: false,
-          streak: msg.payload.streak,
+          streak: p.streak,
         })
+      }
+
+      if (msg.type === 'reminder' || msg.type === 'HABIT_REMINDER') {
+        const p = msg.payload as ReminderEventPayload
+        // Only show toast when the tab is visible
+        if (document.visibilityState === 'visible') {
+          addToast({
+            type: 'info',
+            message: p.body ? `${p.title}: ${p.body}` : p.title,
+          })
+        }
+        // Always add to notification store so the bell reflects it
+        const notification: Notification = {
+          id: p.notificationId,
+          userId: p.userId,
+          type: 'reminder',
+          title: p.title,
+          body: p.body ?? '',
+          read: false,
+          createdAt: new Date().toISOString(),
+        }
+        addNotification(notification)
       }
     }
 

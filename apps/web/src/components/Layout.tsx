@@ -2,6 +2,7 @@ import React from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { LayoutDashboard, BarChart3, LogOut, Leaf } from 'lucide-react'
 import { useStore } from '../store/useStore'
+import { NotificationBell } from './NotificationBell'
 
 interface Props {
   children: React.ReactNode
@@ -54,6 +55,7 @@ export function Layout({ children }: Props) {
 
           {/* User */}
           <div className="flex items-center gap-3">
+            <NotificationBell />
             <div className="hidden sm:flex items-center gap-2">
               <div className="h-7 w-7 rounded-full bg-brand-500 flex items-center justify-center text-white text-xs font-bold">
                 {user?.username?.[0]?.toUpperCase() ?? 'U'}

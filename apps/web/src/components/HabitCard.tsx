@@ -1,7 +1,8 @@
 import React, { useState } from 'react'
-import { Check, Flame, RotateCcw, Loader2 } from 'lucide-react'
+import { Check, Flame, RotateCcw, Loader2, Bell } from 'lucide-react'
 import { habits as habitApi, Habit } from '../api/client'
 import { useStore } from '../store/useStore'
+import { ReminderSettings } from './ReminderSettings'
 
 interface Props {
   habit: Habit
@@ -24,6 +25,7 @@ const ICONS: Record<string, string> = {
 
 export function HabitCard({ habit }: Props) {
   const [loading, setLoading] = useState(false)
+  const [showReminders, setShowReminders] = useState(false)
   const updateHabit = useStore((s) => s.updateHabit)
   const addToast = useStore((s) => s.addToast)
 
@@ -98,6 +100,15 @@ export function HabitCard({ habit }: Props) {
         )}
       </div>
 
+      {/* Reminder bell */}
+      <button
+        onClick={() => setShowReminders(true)}
+        className="shrink-0 text-slate-300 hover:text-brand-400 transition-colors"
+        title="Set reminder"
+      >
+        <Bell size={15} />
+      </button>
+
       {/* Action button */}
       <button
         onClick={toggle}
@@ -125,6 +136,10 @@ export function HabitCard({ habit }: Props) {
           </>
         )}
       </button>
+
+      {showReminders && (
+        <ReminderSettings habitId={habit.id} onClose={() => setShowReminders(false)} />
+      )}
     </div>
   )
 }
